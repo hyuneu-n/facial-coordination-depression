@@ -1,0 +1,41 @@
+# ==== Data: never commit clinical datasets (privacy + license) ====
+data/
+features/
+results/
+
+# raw feature / signal files
+*.csv
+*.npy
+*.npz
+*.pkl
+*.wav
+*.mp4
+*.avi
+*.mat
+*.tar.gz
+*.zip
+!requirements.txt
+
+# OpenFace raw outputs
+*_CLNF_*
+*_OpenFace*
+*_AUs*
+
+# downloaded papers / reference code (large, external)
+papers/
+refcode/
+
+# models / checkpoints / logs
+*.pt
+*.pth
+*.log
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# OS
+.DS_Store
