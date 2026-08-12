@@ -1,0 +1,15 @@
+로딩...(E-DAIC 느림)
+총 457명: {'CMDC': 44, 'DAIC': 141, 'E-DAIC': 272}, 우울 124
+
+=== 전체인터뷰 공분산 (앵커 없이) ===
+  CMDC within: AUC=0.810±0.018 (n=44)
+  DAIC within: AUC=0.575±0.043 (n=141)
+  E-DAIC within: AUC=0.495±0.015 (n=272)
+  POOLED 전체: AUC=0.564±0.023 (n=457)
+
+=== Leave-One-Corpus-Out (교차 일반화) ===
+  train(2corpus)→test CMDC: AUC=0.564 (n_test=44)
+  train(2corpus)→test DAIC: AUC=0.579 (n_test=141)
+  train(2corpus)→test E-DAIC: AUC=0.574 (n_test=272)
+
+DONE (CSV saved)

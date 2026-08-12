@@ -1,0 +1,14 @@
+E-DAIC 로드: 272명
+coverage 분포: min=0.01 median=0.88 max=0.99
+
+=== 1) coverage threshold별 AUC (frontal 공분산) ===
+  coverage>=0.0: n=272 AUC=0.564
+  coverage>=0.3: n=246 AUC=0.526
+  coverage>=0.5: n=226 AUC=0.612
+  coverage>=0.6: n=218 AUC=0.609
+  coverage>=0.7: n=199 AUC=0.597
+
+=== 2) 필터 비교 (전체 참가자) ===
+  success만(기존): n=272 AUC=0.545
+  frontal+highconf: n=272 AUC=0.564
+DONE

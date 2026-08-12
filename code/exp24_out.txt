@@ -1,0 +1,4 @@
+VNN 입력: n=44 cov(44, 17, 17) MDD18/HC26
+VNN AUC=0.554±0.076
+(baseline tangent+logistic: 0.885)
+→ 열세

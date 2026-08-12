@@ -1,0 +1,5 @@
+CMDC 앵커 Q3+Q7: n=44, MDD18/HC26
+
+=== 협응 5종 측정 (CMDC 앵커, 10seed) ===
+  1) 공분산 Riemannian      AUC=0.885±0.025  perm_p=0.010 **
+  2) 시간지연 상관             AUC=0.802±0.025  perm_p=0.010 **

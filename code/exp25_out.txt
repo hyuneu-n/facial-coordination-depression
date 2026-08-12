@@ -1,0 +1,19 @@
+n=44, tangent dim=153, MDD18/HC26
+=== 커스텀: sparse AU-pair 선택 비교 (10seed) ===
+  L2 로지스틱(baseline)            AUC=0.885±0.024
+  L1 sparse(쌍 선택)              AUC=0.754±0.064
+  L1 강한선택(C=0.2)               AUC=0.761±0.064
+  ElasticNet                   AUC=0.791±0.039
+
+L1 선택된 쌍: 19/153개
+상위 판별 AU쌍:
+  AU12_r×AU45_r (0.86)
+  AU25_r×AU26_r (0.72)
+  AU12_r×AU25_r (0.61)
+  AU05_r×AU12_r (0.57)
+  AU05_r×AU15_r (0.29)
+  AU17_r×AU26_r (0.29)
+  AU04_r×AU26_r (0.27)
+  AU14_r×AU23_r (0.23)
+
+DONE (CSV saved)

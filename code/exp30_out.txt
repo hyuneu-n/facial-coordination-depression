@@ -1,0 +1,6 @@
+=== 최종 통합 (앵커+공분산 Riemannian) ===
+  CMDC(앵커Q3+7)       n=44 우울18 AUC=0.889±0.022 perm_p=0.010
+  DAIC(앵커ALLneg)     n=94 우울22 AUC=0.711±0.046 perm_p=0.020
+  E-DAIC(품질게이트)      n=272 우울65 AUC=0.563±0.027 perm_p=0.099
+
+DONE → FINAL_table.csv
