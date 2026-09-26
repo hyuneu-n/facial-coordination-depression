@@ -1,0 +1,307 @@
+"""bench/run.py — 통일 벤치마크 진입점.
+사용: python -m bench.run --corpus dvlog --model blstm --seeds 5
+프로토콜은 bench/README.md 에 고정. 임계값 0.5 고정, val AUC 로 모델선택.
+"""
+import argparse, csv, numpy as np, torch, torch.nn as nn
+from pathlib import Path
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.decomposition import PCA
+
+from bench.data import LOADERS
+from bench.models import build, make_covs, REGISTRY
+
+
+def needs_covs(name):
+    return getattr(REGISTRY[name], 'needs_covs', False)
+from bench.metrics import report, nparams, KEYS
+
+DEV = 'cuda' if torch.cuda.is_available() else 'cpu'
+EP, BS, LR, WD = 60, 64, 7e-4, 1e-4
+OUT = Path('/home/hyuneun/disk_b/🟡facial-prodrome/results/bench')
+
+
+def t(a):
+    return torch.tensor(a, dtype=torch.float32, device=DEV)
+
+
+def segment(X, a, b):
+    """[a,b) 구간 프레임만 남기고 원래 길이 T 로 재보간.
+    학습된 모델을 그대로 쓰면서 '세션의 어느 구간이 정보를 갖는가'를 비교한다."""
+    T0 = X.shape[1]
+    i0, i1 = int(T0 * a), max(int(T0 * a) + 8, int(T0 * b))
+    i1 = min(i1, T0)
+    k = i1 - i0
+    idx = np.linspace(0, k - 1, T0)
+    ar = np.arange(k)
+    out = np.empty_like(X)
+    for bi in range(X.shape[0]):
+        for c in range(X.shape[2]):
+            out[bi, :, c] = np.interp(idx, ar, X[bi, i0:i1, c])
+    return out
+
+
+def _cut_resamp(seqs, a, b, zscore=True):
+    """원본 가변길이 시퀀스들의 [a,b) 구간을 잘라 T=256 으로 리샘플.
+    이미 리샘플된 것을 다시 자르면 시간 해상도가 사라지므로 반드시 원본에서 자른다."""
+    from bench.data import resamp as _rs, zs as _zs, T as _T
+    out = []
+    for X in seqs:
+        n = len(X)
+        i0 = int(n * a)
+        i1 = max(i0 + 16, int(n * b))
+        i1 = min(i1, n)
+        if i1 - i0 < 16:
+            i0 = max(0, i1 - 16)
+        seg = np.asarray(X[i0:i1], dtype=np.float64)
+        out.append(_rs(_zs(seg) if zscore else seg, _T))
+    return np.asarray(out, np.float32)
+
+
+def truncate(X, frac):
+    """(구버전 — 리샘플된 배열을 자르는 방식. 시간해상도 손실로 불공정하므로 미사용)"""
+    if frac >= 1.0:
+        return X
+    T0 = X.shape[1]
+    k = max(8, int(T0 * frac))
+    idx = np.linspace(0, k - 1, T0)
+    ar = np.arange(k)
+    out = np.empty_like(X)
+    for b in range(X.shape[0]):
+        for c in range(X.shape[2]):
+            out[b, :, c] = np.interp(idx, ar, X[b, :k, c])
+    return out
+
+
+def make_folds(d, seed=0):
+    """공식 fold 가 있으면 1개, 없으면 5-fold stratified CV(train 의 15%를 valid)."""
+    N = len(d['y'])
+    if d['fold'] is not None:
+        yield (d['fold'] == 'train'), (d['fold'] == 'valid'), (d['fold'] == 'test')
+        return
+    y = d['y']
+    for tri, tei in StratifiedKFold(5, shuffle=True, random_state=seed).split(np.zeros(N), y):
+        rng = np.random.RandomState(seed)
+        tri = tri.copy(); rng.shuffle(tri)
+        k = max(1, int(len(tri) * 0.15))
+        tr = np.zeros(N, bool); va = np.zeros(N, bool); te = np.zeros(N, bool)
+        va[tri[:k]] = True; tr[tri[k:]] = True; te[tei] = True
+        yield tr, va, te
+
+
+def _vsrc(d):
+    """coordination 계산용 visual. Xv_raw 가 있으면 그것(exp97 충실도), 없으면 Xv."""
+    return d['Xv_raw'] if d.get('Xv_raw') is not None else d['Xv']
+
+
+def prep_covs(d, tr, pca_dim=20, W=64, STR=32):
+    """train 으로 PCA fit -> 윈도우 공분산과 윈도우별 특징 평균을 함께 반환.
+    특징 평균(wfeat)은 coordination 을 제거한 대조군(nocov)에서 쓴다."""
+    V = _vsrc(d)
+    Xtr = np.vstack([V[i][::3] for i in np.where(tr)[0]])
+    dim = min(pca_dim, Xtr.shape[1])
+    pca = PCA(dim).fit(Xtr)
+    covs = make_covs(V, pca, W=W, STR=STR)
+    wf = []
+    for sq in V:
+        Z = pca.transform(sq)
+        sd = Z.std(0); sd = np.where(sd < 1e-8, 1.0, sd)
+        Z = (Z - Z.mean(0)) / sd
+        wf.append([Z[i:i + W].mean(0) for i in range(0, Z.shape[0] - W + 1, STR)])
+    return covs, np.asarray(wf, np.float32)
+
+
+def fit_eval(model_name, d, tr, va, te, seed, covs=None, wfeat=None, early=None, pca_dim=20, segs=None):
+    torch.manual_seed(seed); np.random.seed(seed)
+    net = build(model_name, d['Xv'].shape[2], d['Xa'].shape[2],
+                **({'d': covs.shape[-1]} if (needs_covs(model_name) and covs is not None) else {})).to(DEV)
+    opt = torch.optim.Adam(net.parameters(), LR, weight_decay=WD)
+    y = d['y']
+    pw = t([(y[tr] == 0).sum() / max(1, (y[tr] == 1).sum())])
+    lf = nn.BCEWithLogitsLoss(pos_weight=pw)
+    Xv, Xa, yt = t(d['Xv']), t(d['Xa']), t(y)
+    C = t(covs) if covs is not None else None
+    Wf = t(wfeat) if wfeat is not None else None
+
+    def fwd(idx, xv=None, xa=None):
+        a = Xv[idx] if xv is None else xv
+        b = Xa[idx] if xa is None else xa
+        if C is None and Wf is None:
+            return net(a, b)
+        kw = {}
+        if C is not None: kw['covs'] = C[idx]
+        if Wf is not None: kw['wfeat'] = Wf[idx]
+        return net(a, b, **kw)
+
+    itr = np.where(tr)[0]; iva = np.where(va)[0]; ite = np.where(te)[0]
+    best, bp, bep = -1, None, -1
+    for ep in range(EP):
+        net.train()
+        perm = np.random.permutation(len(itr))
+        for i in range(0, len(itr), BS):
+            b = itr[perm[i:i + BS]]
+            opt.zero_grad(); lf(fwd(b), yt[b]).backward(); opt.step()
+        net.eval()
+        with torch.no_grad():
+            pv = torch.sigmoid(fwd(iva)).cpu().numpy()
+            pt = torch.sigmoid(fwd(ite)).cpu().numpy()
+        try:
+            a = roc_auc_score(y[iva], pv)
+        except ValueError:
+            a = -1
+        if a > best:
+            best, bp, bep = a, pt, ep
+            if early or segs:
+                torch.save(net.state_dict(), f'/tmp/bench_best_{model_name}_{seed}.pt')
+    if bp is None:
+        with torch.no_grad():
+            bp = torch.sigmoid(fwd(ite)).cpu().numpy()
+
+    early_preds, seg_preds = {}, {}
+    if early or segs:
+        net.load_state_dict(torch.load(f'/tmp/bench_best_{model_name}_{seed}.pt'))
+        net.eval()
+    if segs:
+        from sklearn.decomposition import PCA as _P
+        Vs = _vsrc(d)
+        pc = _P(min(pca_dim, Vs.shape[2])).fit(np.vstack([Vs[i][::3] for i in itr])) \
+            if needs_covs(model_name) else None
+        Vv2 = d.get('Xv_var'); Av2 = d.get('Xa_var')
+        for (aa, bb) in segs:
+            sv = [Vv2[i] for i in ite]; sa = [Av2[i] for i in ite]
+            Xvc = t(_cut_resamp(sv, aa, bb))
+            Xac = t(_cut_resamp(sa, aa, bb))
+            with torch.no_grad():
+                if needs_covs(model_name):
+                    Cc = t(make_covs(_cut_resamp(sv, aa, bb, zscore=False), pc))
+                    seg_preds[(aa, bb)] = torch.sigmoid(net(Xvc, Xac, covs=Cc)).cpu().numpy()
+                else:
+                    seg_preds[(aa, bb)] = torch.sigmoid(net(Xvc, Xac)).cpu().numpy()
+    if early:
+        Vv = d.get('Xv_var'); Av = d.get('Xa_var')
+        if Vv is None:
+            raise RuntimeError('조기탐지에는 원본 가변길이 시퀀스(Xv_var)가 필요하다')
+        from sklearn.decomposition import PCA as _P
+        pcE = None
+        if needs_covs(model_name):
+            Vs = _vsrc(d)
+            pcE = _P(min(pca_dim, Vs.shape[2])).fit(np.vstack([Vs[i][::3] for i in itr]))
+        for fr in early:
+            sv = [Vv[i] for i in ite]; sa = [Av[i] for i in ite]
+            Xvc = t(_cut_resamp(sv, 0.0, fr))
+            Xac = t(_cut_resamp(sa, 0.0, fr))
+            with torch.no_grad():
+                if needs_covs(model_name):
+                    # coordination 경로는 z-score 없이 (exp97 충실도)
+                    Cc = t(make_covs(_cut_resamp(sv, 0.0, fr, zscore=False), pcE))
+                    early_preds[fr] = torch.sigmoid(net(Xvc, Xac, covs=Cc)).cpu().numpy()
+                else:
+                    early_preds[fr] = torch.sigmoid(net(Xvc, Xac)).cpu().numpy()
+    return bp, ite, nparams(net), early_preds, seg_preds
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--corpus', required=True)
+    ap.add_argument('--model', required=True)
+    ap.add_argument('--seeds', type=int, default=5)
+    ap.add_argument('--pca', type=int, default=20)
+    ap.add_argument('--norm', type=int, default=1)
+    ap.add_argument('--lr', type=float, default=None)
+    ap.add_argument('--ep', type=int, default=None)
+    ap.add_argument('--tag', default='')
+    ap.add_argument('--early', default='')
+    ap.add_argument('--seg', default='')
+    a = ap.parse_args()
+
+    import inspect
+    fn = LOADERS[a.corpus]
+    d = fn(norm=bool(a.norm)) if 'norm' in inspect.signature(fn).parameters else fn()
+    global LR, EP
+    if a.lr: LR = a.lr
+    if a.ep: EP = a.ep
+    y = d['y']
+    print(f'[{a.corpus}] N={len(y)} dep={int(y.sum())} Xv={d["Xv"].shape} Xa={d["Xa"].shape}',
+          flush=True)
+
+    fracs = [float(x) for x in a.early.split(',') if x.strip()] if a.early else None
+    segl = [tuple(float(z) for z in x.split(':')) for x in a.seg.split(',') if x.strip()] \
+        if a.seg else None
+    per, oof_all, npar = [], [], 0
+    early_acc = {f: [] for f in (fracs or [])}
+    seg_acc = {g: [] for g in (segl or [])}
+    for s in range(a.seeds):
+        preds = np.zeros(len(y)); mask = np.zeros(len(y), bool)
+        ep_store = {f: np.zeros(len(y)) for f in (fracs or [])}
+        sg_store = {g: np.zeros(len(y)) for g in (segl or [])}
+        for tr, va, te in make_folds(d, seed=s):
+            cw = prep_covs(d, tr, a.pca) if needs_covs(a.model) else (None, None)
+            p, ite, npar, eprd, sprd = fit_eval(a.model, d, tr, va, te, s, covs=cw[0], wfeat=cw[1],
+                                                early=fracs, pca_dim=a.pca, segs=segl)
+            preds[ite] = p; mask[ite] = True
+            for f, v in eprd.items():
+                ep_store[f][ite] = v
+            for g, v in sprd.items():
+                sg_store[g][ite] = v
+        for f in (fracs or []):
+            early_acc[f].append(report(y[mask], ep_store[f][mask]))
+        for g in (segl or []):
+            seg_acc[g].append(report(y[mask], sg_store[g][mask]))
+        r = report(y[mask], preds[mask])
+        per.append(r); oof_all.append((preds, mask))
+        np.save(OUT / f'pred_{a.corpus}_{a.model}{a.tag}_s{s}.npy', preds)
+        print(f'  seed{s}: ' + ' '.join(f'{k}={r[k]:.4f}' for k in KEYS), flush=True)
+
+    m0 = oof_all[0][1]
+    ens = report(y[m0], np.mean([p for p, _ in oof_all], 0)[m0])
+    print(f'\n[{a.corpus}/{a.model}] params={npar:,}')
+    row = [a.model + a.tag, npar]
+    for k in KEYS:
+        v = [x[k] for x in per]
+        print(f'  {k:5s} seed평균 {np.mean(v):.4f}±{np.std(v):.4f} | 앙상블 {ens[k]:.4f}')
+        row.append(f'{np.mean(v):.4f}')
+    row += [f'{ens[k]:.4f}' for k in KEYS]
+
+    f = OUT / f'{a.corpus}.csv'
+    new = not f.exists()
+    with open(f, 'a', newline='') as fh:
+        w = csv.writer(fh)
+        if new:
+            w.writerow(['model', 'params'] + [f'{k}_mean' for k in KEYS] + [f'{k}_ens' for k in KEYS])
+        w.writerow(row)
+
+    if segl:
+        print('\n[구간 통제] 세션의 특정 구간만으로 평가 — 앞부분이 특별한지 검증')
+        sf = OUT / f'seg_{a.corpus}.csv'
+        news = not sf.exists()
+        with open(sf, 'a', newline='') as fh:
+            w = csv.writer(fh)
+            if news:
+                w.writerow(['model', 'start', 'end', 'f1_mean', 'f1_std', 'auc_mean', 'auc_std'])
+            for g in segl:
+                f1 = [x['f1'] for x in seg_acc[g]]
+                au = [x['auc'] for x in seg_acc[g]]
+                print(f'  {int(g[0]*100):3d}-{int(g[1]*100):3d}%  F1={np.mean(f1):.4f}±{np.std(f1):.4f}'
+                      f'  AUC={np.mean(au):.4f}±{np.std(au):.4f}')
+                w.writerow([a.model + a.tag, g[0], g[1], f'{np.mean(f1):.4f}', f'{np.std(f1):.4f}',
+                            f'{np.mean(au):.4f}', f'{np.std(au):.4f}'])
+
+    if fracs:
+        print('\n[조기탐지] 앞 p% 만으로 평가 (학습은 전체 길이, 재학습 없음)')
+        ef = OUT / f'early_{a.corpus}.csv'
+        newe = not ef.exists()
+        with open(ef, 'a', newline='') as fh:
+            w = csv.writer(fh)
+            if newe:
+                w.writerow(['model', 'frac', 'f1_mean', 'f1_std', 'auc_mean', 'auc_std'])
+            for f in fracs:
+                f1 = [x['f1'] for x in early_acc[f]]
+                au = [x['auc'] for x in early_acc[f]]
+                print(f'  {int(f*100):3d}%  F1={np.mean(f1):.4f}±{np.std(f1):.4f}'
+                      f'  AUC={np.mean(au):.4f}±{np.std(au):.4f}')
+                w.writerow([a.model + a.tag, f, f'{np.mean(f1):.4f}', f'{np.std(f1):.4f}',
+                            f'{np.mean(au):.4f}', f'{np.std(au):.4f}'])
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,203 @@
+"""bench/run.py — 통일 벤치마크 진입점.
+사용: python -m bench.run --corpus dvlog --model blstm --seeds 5
+프로토콜은 bench/README.md 에 고정. 임계값 0.5 고정, val AUC 로 모델선택.
+"""
+import argparse, csv, numpy as np, torch, torch.nn as nn
+from pathlib import Path
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.decomposition import PCA
+
+from bench.data import LOADERS
+from bench.models import build, make_covs
+from bench.metrics import report, nparams, KEYS
+
+DEV = 'cuda' if torch.cuda.is_available() else 'cpu'
+EP, BS, LR, WD = 60, 64, 7e-4, 1e-4
+OUT = Path('/home/hyuneun/disk_b/🟡facial-prodrome/results/bench')
+
+
+def t(a):
+    return torch.tensor(a, dtype=torch.float32, device=DEV)
+
+
+def truncate(X, frac):
+    """앞 frac 비율 프레임만 남기고 원래 길이 T 로 재보간.
+    모델 입력 길이를 유지하므로 재학습 없이 조기탐지를 평가할 수 있다."""
+    if frac >= 1.0:
+        return X
+    T0 = X.shape[1]
+    k = max(8, int(T0 * frac))
+    idx = np.linspace(0, k - 1, T0)
+    ar = np.arange(k)
+    out = np.empty_like(X)
+    for b in range(X.shape[0]):
+        for c in range(X.shape[2]):
+            out[b, :, c] = np.interp(idx, ar, X[b, :k, c])
+    return out
+
+
+def make_folds(d, seed=0):
+    """공식 fold 가 있으면 1개, 없으면 5-fold stratified CV(train 의 15%를 valid)."""
+    N = len(d['y'])
+    if d['fold'] is not None:
+        yield (d['fold'] == 'train'), (d['fold'] == 'valid'), (d['fold'] == 'test')
+        return
+    y = d['y']
+    for tri, tei in StratifiedKFold(5, shuffle=True, random_state=seed).split(np.zeros(N), y):
+        rng = np.random.RandomState(seed)
+        tri = tri.copy(); rng.shuffle(tri)
+        k = max(1, int(len(tri) * 0.15))
+        tr = np.zeros(N, bool); va = np.zeros(N, bool); te = np.zeros(N, bool)
+        va[tri[:k]] = True; tr[tri[k:]] = True; te[tei] = True
+        yield tr, va, te
+
+
+def prep_covs(d, tr, pca_dim=20):
+    """train 으로 PCA fit -> 전체 윈도우 공분산 사전계산."""
+    Xtr = np.vstack([d['Xv'][i][::3] for i in np.where(tr)[0]])
+    dim = min(pca_dim, Xtr.shape[1])
+    pca = PCA(dim).fit(Xtr)
+    return make_covs(d['Xv'], pca)
+
+
+def fit_eval(model_name, d, tr, va, te, seed, covs=None, early=None, pca_dim=20):
+    torch.manual_seed(seed); np.random.seed(seed)
+    net = build(model_name, d['Xv'].shape[2], d['Xa'].shape[2],
+                **({'d': covs.shape[-1]} if model_name == 'ours' else {})).to(DEV)
+    opt = torch.optim.Adam(net.parameters(), LR, weight_decay=WD)
+    y = d['y']
+    pw = t([(y[tr] == 0).sum() / max(1, (y[tr] == 1).sum())])
+    lf = nn.BCEWithLogitsLoss(pos_weight=pw)
+    Xv, Xa, yt = t(d['Xv']), t(d['Xa']), t(y)
+    C = t(covs) if covs is not None else None
+
+    def fwd(idx, xv=None, xa=None):
+        a = Xv[idx] if xv is None else xv
+        b = Xa[idx] if xa is None else xa
+        return net(a, b, covs=C[idx]) if C is not None else net(a, b)
+
+    itr = np.where(tr)[0]; iva = np.where(va)[0]; ite = np.where(te)[0]
+    best, bp, bep = -1, None, -1
+    for ep in range(EP):
+        net.train()
+        perm = np.random.permutation(len(itr))
+        for i in range(0, len(itr), BS):
+            b = itr[perm[i:i + BS]]
+            opt.zero_grad(); lf(fwd(b), yt[b]).backward(); opt.step()
+        net.eval()
+        with torch.no_grad():
+            pv = torch.sigmoid(fwd(iva)).cpu().numpy()
+            pt = torch.sigmoid(fwd(ite)).cpu().numpy()
+        try:
+            a = roc_auc_score(y[iva], pv)
+        except ValueError:
+            a = -1
+        if a > best:
+            best, bp, bep = a, pt, ep
+            if early:
+                torch.save(net.state_dict(), f'/tmp/bench_best_{model_name}_{seed}.pt')
+    if bp is None:
+        with torch.no_grad():
+            bp = torch.sigmoid(fwd(ite)).cpu().numpy()
+
+    early_preds = {}
+    if early:
+        net.load_state_dict(torch.load(f'/tmp/bench_best_{model_name}_{seed}.pt'))
+        net.eval()
+        for fr in early:
+            Xvc = t(truncate(d['Xv'][ite], fr))
+            Xac = t(truncate(d['Xa'][ite], fr))
+            if model_name == 'ours':
+                from sklearn.decomposition import PCA
+                pc = PCA(min(pca_dim, d['Xv'].shape[2])).fit(
+                    np.vstack([d['Xv'][i][::3] for i in itr]))
+                Cc = t(make_covs(truncate(d['Xv'][ite], fr), pc))
+                with torch.no_grad():
+                    early_preds[fr] = torch.sigmoid(net(Xvc, Xac, covs=Cc)).cpu().numpy()
+            else:
+                with torch.no_grad():
+                    early_preds[fr] = torch.sigmoid(net(Xvc, Xac)).cpu().numpy()
+    return bp, ite, nparams(net), early_preds
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--corpus', required=True)
+    ap.add_argument('--model', required=True)
+    ap.add_argument('--seeds', type=int, default=5)
+    ap.add_argument('--pca', type=int, default=20)
+    ap.add_argument('--norm', type=int, default=1)
+    ap.add_argument('--lr', type=float, default=None)
+    ap.add_argument('--ep', type=int, default=None)
+    ap.add_argument('--tag', default='')
+    ap.add_argument('--early', default='')
+    a = ap.parse_args()
+
+    import inspect
+    fn = LOADERS[a.corpus]
+    d = fn(norm=bool(a.norm)) if 'norm' in inspect.signature(fn).parameters else fn()
+    global LR, EP
+    if a.lr: LR = a.lr
+    if a.ep: EP = a.ep
+    y = d['y']
+    print(f'[{a.corpus}] N={len(y)} dep={int(y.sum())} Xv={d["Xv"].shape} Xa={d["Xa"].shape}',
+          flush=True)
+
+    fracs = [float(x) for x in a.early.split(',') if x.strip()] if a.early else None
+    per, oof_all, npar = [], [], 0
+    early_acc = {f: [] for f in (fracs or [])}
+    for s in range(a.seeds):
+        preds = np.zeros(len(y)); mask = np.zeros(len(y), bool)
+        ep_store = {f: np.zeros(len(y)) for f in (fracs or [])}
+        for tr, va, te in make_folds(d, seed=s):
+            covs = prep_covs(d, tr, a.pca) if a.model == 'ours' else None
+            p, ite, npar, eprd = fit_eval(a.model, d, tr, va, te, s, covs=covs,
+                                          early=fracs, pca_dim=a.pca)
+            preds[ite] = p; mask[ite] = True
+            for f, v in eprd.items():
+                ep_store[f][ite] = v
+        for f in (fracs or []):
+            early_acc[f].append(report(y[mask], ep_store[f][mask]))
+        r = report(y[mask], preds[mask])
+        per.append(r); oof_all.append((preds, mask))
+        np.save(OUT / f'pred_{a.corpus}_{a.model}{a.tag}_s{s}.npy', preds)
+        print(f'  seed{s}: ' + ' '.join(f'{k}={r[k]:.4f}' for k in KEYS), flush=True)
+
+    m0 = oof_all[0][1]
+    ens = report(y[m0], np.mean([p for p, _ in oof_all], 0)[m0])
+    print(f'\n[{a.corpus}/{a.model}] params={npar:,}')
+    row = [a.model + a.tag, npar]
+    for k in KEYS:
+        v = [x[k] for x in per]
+        print(f'  {k:5s} seed평균 {np.mean(v):.4f}±{np.std(v):.4f} | 앙상블 {ens[k]:.4f}')
+        row.append(f'{np.mean(v):.4f}')
+    row += [f'{ens[k]:.4f}' for k in KEYS]
+
+    f = OUT / f'{a.corpus}.csv'
+    new = not f.exists()
+    with open(f, 'a', newline='') as fh:
+        w = csv.writer(fh)
+        if new:
+            w.writerow(['model', 'params'] + [f'{k}_mean' for k in KEYS] + [f'{k}_ens' for k in KEYS])
+        w.writerow(row)
+
+    if fracs:
+        print('\n[조기탐지] 앞 p% 만으로 평가 (학습은 전체 길이, 재학습 없음)')
+        ef = OUT / f'early_{a.corpus}.csv'
+        newe = not ef.exists()
+        with open(ef, 'a', newline='') as fh:
+            w = csv.writer(fh)
+            if newe:
+                w.writerow(['model', 'frac', 'f1_mean', 'f1_std', 'auc_mean', 'auc_std'])
+            for f in fracs:
+                f1 = [x['f1'] for x in early_acc[f]]
+                au = [x['auc'] for x in early_acc[f]]
+                print(f'  {int(f*100):3d}%  F1={np.mean(f1):.4f}±{np.std(f1):.4f}'
+                      f'  AUC={np.mean(au):.4f}±{np.std(au):.4f}')
+                w.writerow([a.model + a.tag, f, f'{np.mean(f1):.4f}', f'{np.std(f1):.4f}',
+                            f'{np.mean(au):.4f}', f'{np.std(au):.4f}'])
+
+
+if __name__ == '__main__':
+    main()
