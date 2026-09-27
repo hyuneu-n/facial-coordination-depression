@@ -17,6 +17,7 @@ def needs_covs(name):
 from bench.metrics import report, nparams, KEYS
 
 DEV = 'cuda' if torch.cuda.is_available() else 'cpu'
+COORD_LR_MULT = 1.0
 EP, BS, LR, WD = 60, 64, 7e-4, 1e-4
 OUT = Path('/home/hyuneun/disk_b/🟡facial-prodrome/results/bench')
 
@@ -115,7 +116,15 @@ def fit_eval(model_name, d, tr, va, te, seed, covs=None, wfeat=None, early=None,
     torch.manual_seed(seed); np.random.seed(seed)
     net = build(model_name, d['Xv'].shape[2], d['Xa'].shape[2],
                 **({'d': covs.shape[-1]} if (needs_covs(model_name) and covs is not None) else {})).to(DEV)
-    opt = torch.optim.Adam(net.parameters(), LR, weight_decay=WD)
+    if COORD_LR_MULT != 1.0 and hasattr(net, 'coord'):
+        cp = list(net.coord.parameters())
+        cid = {id(q) for q in cp}
+        rest = [q for q in net.parameters() if id(q) not in cid]
+        opt = torch.optim.Adam([{'params': rest, 'lr': LR},
+                                {'params': cp, 'lr': LR * COORD_LR_MULT}],
+                               weight_decay=WD)
+    else:
+        opt = torch.optim.Adam(net.parameters(), LR, weight_decay=WD)
     y = d['y']
     pw = t([(y[tr] == 0).sum() / max(1, (y[tr] == 1).sum())])
     lf = nn.BCEWithLogitsLoss(pos_weight=pw)
@@ -209,6 +218,8 @@ def main():
     ap.add_argument('--norm', type=int, default=1)
     ap.add_argument('--lr', type=float, default=None)
     ap.add_argument('--ep', type=int, default=None)
+    ap.add_argument('--coord_lr_mult', type=float, default=1.0,
+                    help='coordination 브랜치 학습률 배수 (1.0=host 와 동일)')
     ap.add_argument('--tag', default='')
     ap.add_argument('--early', default='')
     ap.add_argument('--seg', default='')
@@ -217,9 +228,12 @@ def main():
     import inspect
     fn = LOADERS[a.corpus]
     d = fn(norm=bool(a.norm)) if 'norm' in inspect.signature(fn).parameters else fn()
-    global LR, EP
+    global LR, EP, COORD_LR_MULT
     if a.lr: LR = a.lr
     if a.ep: EP = a.ep
+    COORD_LR_MULT = a.coord_lr_mult
+    if COORD_LR_MULT != 1.0:
+        print(f'  [coordination 브랜치 학습률 x{COORD_LR_MULT}]', flush=True)
     y = d['y']
     print(f'[{a.corpus}] N={len(y)} dep={int(y.sum())} Xv={d["Xv"].shape} Xa={d["Xa"].shape}',
           flush=True)

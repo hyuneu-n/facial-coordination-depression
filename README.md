@@ -1,91 +1,153 @@
-# Facial Coordination: Interpretable, Lightweight Depression Recognition from Facial Dynamics
+# Facial Coordination: A Plug-in Encoder for Multimodal Depression Recognition
 
-Research code for depression recognition from **facial expression coordination** — the covariance structure of how facial Action Units (or landmarks) move together over time, modeled on the Riemannian SPD manifold. Language-independent, on-device-scale (tens of thousands of parameters), and interpretable — designed as an alternative to black-box deep models for small-sample clinical and cross-corpus settings.
+Research code for depression recognition from **facial expression coordination** — the covariance structure of how facial landmarks / Action Units move together over time. The current focus is a **plug-in encoder**: a small branch (+32,000 parameters) that attaches to an existing multimodal model without modifying it, so any performance change is attributable to the branch alone.
 
-> **Status:** research / work-in-progress. This repository holds the experimental pipeline and analysis scripts. **No datasets are included** (see *Data* below).
+> **Status:** research / work-in-progress. This repository holds the experimental pipeline and analysis scripts. **No datasets are included** (see *Data*).
 
-## Motivation
+---
 
-Most video-based depression recognition treats a session as a single static snapshot and optimizes accuracy on one benchmark. This project asks three different questions instead:
+## What this repository actually establishes
 
-1. **What structure carries the signal?** Not individual facial muscle activity, but the **coordination** (covariance) between muscles/landmarks — modeled on the SPD manifold rather than flattened to Euclidean features.
-2. **Where in time does the signal live?** Given a coordination model, how early in a session is depression detectable, and does that hold across corpora — a step toward the long-term goal of detecting a **prodromal (pre-onset) trajectory** rather than a static label.
-3. **Is the signal real, or is it confound?** When a benchmark's performance is audited (position/scale/pose, recording environment), does it survive — and does a lightweight, interpretable design stay robust where a heavier baseline collapses?
+This section is written to be checkable. Claims that did not survive testing are listed in *Retracted claims* below, not quietly removed.
 
-## Key findings (so far)
+### 1. A unified benchmark harness (`code/bench/`)
 
-**Coordination + lightweight design (D-Vlog, official split)**
-- SPD-manifold coordination encoder (BiMap → ReEig → LogEig) + audio branch, simple concat fusion, reaches **AUC 0.81 / F1 0.79** vs. the original D-Vlog paper's 0.63/0.63 — at **~50-68K parameters** (CPU ~2ms/sample), roughly 100x smaller than deep multimodal baselines.
-- Cross-corpus: strong where facial signal is expressive/clean (CMDC AUC 0.89, D-Vlog 0.81), weak where it isn't (LMVD 0.63, E-DAIC 0.62) — signal quality, not model capacity, is the limiting factor.
+Four published models for the same task, re-implemented and run under one fixed protocol across five corpora:
 
-**Time-axis earliness (confirmed, replicated)**
-- Truncating a session to its **first 40%** reaches AUC 0.77 vs. 0.80 for the full session (96%) — replicated on **D-Vlog and LMVD**. Learned temporal attention independently confirms the model concentrates on the session start (depressed subjects more front-loaded).
-- The same early-sufficiency pattern holds for PHQ severity regression (CMDC, CCC 0.49 at 40% vs. 0.48 full).
-- Coordination adds information beyond individual-AU dynamics (mean/std/AR1): combined > individual in 3/4 corpora with bootstrap CI excluding 0.
-- The discriminative coordination consistently localizes to the **mouth/chin region (AU15–AU17)** in both clinical (CMDC) and vlog (LMVD) data.
+| Model | Source | Architecture |
+|---|---|---|
+| BLSTM | 2019 baseline | per-modality BiLSTM, temporal mean, concat |
+| TFN | Zadeh et al., EMNLP 2017 | outer-product tensor fusion |
+| **DepDetector** | **Yoon et al., AAAI 2022** | Transformer encoders + cross-modal attention — *the model from the D-Vlog dataset paper* |
+| TAMFN | Zhou et al., IEEE TNSRE 2023 | global-information TCN + time-aware attention fusion |
 
-**Confound audit on an independent longitudinal benchmark (MUD3, ACM MM 2025 / CCAC2026)**
-- Reproduced the MUD3 baseline and found its reported performance is **substantially explained by recording confounds**: face position/scale alone (11-feature logistic regression) reaches F1 0.6875, matching the 1.58M-parameter baseline (F1 0.6717); removing the confound collapses the baseline to **F1 0.334** (lr/epoch sweep rules out under-training as the cause).
-- A lightweight coordination model transplanted from the D-Vlog pipeline, evaluated under the **same confound-free conditions**, holds **F1 0.68–0.75** at 1/50–1/89 the parameter count (Welch t=3.42, p=0.0039, d=1.53, 10 seeds).
-- Coordination itself did **not** transfer to MUD3 (short, edited social-media clips) — confirmed invalid via a frame-count sweep, not merely under-sampled. This is a documented negative result, not silently dropped.
-- The AU15–AU17 discriminative pair identified via landmarks (above) was independently validated against **ground-truth AU intensity** on DISFA (27 subjects, FACS-coded): the pair ranks **8th of 66** AU pairs by real co-activation (r=0.314, p<0.00001).
+**Protocol is fixed in `code/bench/README.md`** (T=256 resample, per-sample z-score, validation-AUC model selection, threshold fixed at 0.5, both seed-mean and ensemble reported).
 
-**Negative results (documented, not hidden)**
-- Cross-lingual "anchor invariance", learned question-weighting (QDS), AU-to-image rendering, and Transformer backbones did not hold up under small-sample constraints (early anchor-based phase).
-- Within-session temporal-dynamics markers (rigidity/complexity) and network-topology features were D-Vlog-specific, not robust cross-corpus.
-- Within-user change-point detection on MUD3 (testing for a longitudinal "state shift") found no signal (all p>0.05) — the genuine longitudinal-prodrome question remains open.
+**Reproduction check (D-Vlog official split, weighted-average F1 — the metric the original papers report):**
+
+| Model | Published | Reproduced | Δ |
+|---|---|---|---|
+| DepDetector | 0.6482 | 0.6477 | −0.0005 |
+| TAMFN | 0.661 | 0.657 | −0.004 |
+
+Depression-specific models reproduce their published numbers, so the harness is comparable to published conditions. Generic baselines (BLSTM, TFN) score 7–11%p *higher* here than in the papers that used them as baselines — reported as-is, which is the conservative direction for our own claims.
+
+### 2. A plug-in encoder that attaches to any host at constant cost
+
+`Graft` wraps any host exposing `features()` / `feat_dim`. The host is left untouched; only the coordination vector is concatenated before a new classifier.
+
+| host | base | grafted | added |
+|---|---|---|---|
+| DepDetector | 202,305 | 234,305 | **+32,000** |
+| BLSTM | 166,529 | 198,529 | **+32,000** |
+| TFN | 31,233 | 63,233 | **+32,000** |
+| TAMFN | 134,852 | 166,852 | **+32,000** |
+
+### 3. Where the graft helps — and where it does not
+
+Seed-mean change from grafting (`fig22_graft_grid.png`). Both metrics shown because they disagree in places:
+
+| corpus | BLSTM | TFN | DepDetector | TAMFN | cells with a drop |
+|---|---|---|---|---|---|
+| **LMVD** (n=1556) | +1.7 / +1.4 | +1.7 / +5.6 | +0.7 / ±0.0 | +1.4 / +5.4 | **0 / 8** |
+| D-Vlog (n=952) | +1.3 / +0.4 | −6.4 / −2.9 | +7.2 / +0.8 | +10.7 / +2.7 | 2 / 8 |
+| MUD3 raw (n=650) | +4.0 / +0.7 | −6.6 / +2.2 | ±0.0 / −0.2 | −7.3 / +3.5 | 3 / 8 |
+| MUD3 confound-removed | +1.8 / −2.0 | +5.3 / +1.8 | −9.9 / +0.2 | +1.1 / +3.8 | 3 / 8 |
+| CMDC (n=45) | +20.2 / −3.0 | +3.4 / −6.9 | +4.1 / +2.8 | −4.0 / +0.3 | 3 / 8 |
+
+*(each cell: ΔF1 %p / ΔAUC %p)*
+
+**LMVD is the only corpus where no host×metric cell degrades.** It is also the largest corpus, with the smallest seed variance. Effects there are small (+0.7–1.7%p F1) but consistent. Significance testing under repeated cross-validation is in progress.
+
+On MUD3 raw with repeated cross-validation (all 650 subjects, 5-fold × 3 repeats), DepDetector + graft gains **F1 +4.8%p and AUC +3.4%p with bootstrap CIs excluding zero** — the first significant result in this line of work.
+
+### 4. Methodological findings (these are robust, and they are warnings)
+
+These came out of trying to validate the encoder and are reported because they affect how anyone should read benchmark tables in this area.
+
+- **Ensembling silently favors high-variance models.** Averaging 5 seeds before scoring reverses the *sign* of the graft effect in several cells (e.g. D-Vlog/TFN: +5.7%p by ensemble, −6.4%p by seed-mean). See `fig24_ensemble_artifact.png`. Comparisons that report only ensemble numbers will overstate any model with higher variance.
+- **TAMFN is not reproducible run-to-run.** Identical code and seeds give different results across executions (F1 0.3448 → 0.3417, ensemble 0.5029 → 0.4824). Its predictions cluster near the 0.5 threshold, so tiny floating-point differences flip decisions. AUC is stable (0.666–0.668); **TAMFN should be reported by AUC only.**
+- **The SPD-manifold layer is not carrying the benefit.** Removing it (`nospd`) matches or beats the full design in 5 of 6 host × corpus comparisons under repeated CV. However `nospd` is itself unstable on the D-Vlog official split — 3 of 5 seeds collapse to near-zero recall (F1 0.18/0.27/0.69/0.71/0.18), a bimodal training failure that fold-averaging hides.
+- **Small test splits make significance unreachable.** With the official MUD3 test set (66 subjects) every bootstrap CI includes zero. Repeated cross-validation over all subjects is required before any significance claim.
+
+### 5. Confound audit (MUD3, ACM MM 2025 / CCAC2026)
+
+The MUD3 authors' own README states the collection method: depressed users were gathered with depression keywords, non-depressed with `grwm` / daily-vlog keywords — **two different filming genres**. Measured face-centre coordinates and scale differ systematically between groups.
+
+Face position/scale alone (4 features, logistic regression) reaches F1 0.6875, matching the 1.58M-parameter published baseline (0.6717). Removing position/scale/rotation collapses that baseline to **F1 0.334**; a learning-rate sweep (100×) and doubled epochs rule out under-training.
+
+This is why every MUD3 result here is reported under **both** raw and confound-removed conditions.
+
+---
+
+## Retracted claims
+
+Listed because earlier versions of this README asserted them.
+
+| Claim | Why it was withdrawn |
+|---|---|
+| "Session earliness: first 40% reaches 96% of full performance — a step toward prodrome detection" | A segment control (first 0–40% / middle 30–70% / last 60–100%) was run for the first time. **All four models score highest on the middle segment.** The proposed model too (front AUC 0.7708 < middle 0.7741). Retention at 40% is 97–101% for *every* model, so it is a property of the data, not of this method. |
+| "Temporal attention concentrates on the session start" | Contradicted by the segment control above; needs re-examination. |
+| "CPU ~2 ms/sample" | That figure excluded the coordination computation (PCA + Ledoit-Wolf, 2.54 ms). Honest total is **3.93 ms**. |
+| "Face position/scale, 11 features" | The leakage probe used **4** features (cx, cy, scale, scale_std). |
+| "Coordination did not transfer to MUD3" | Superseded: with the graft formulation it does transfer on MUD3 raw (significant under repeated CV). |
+
+---
 
 ## Repository layout
 
 ```
-code/       # numbered exploratory experiments (exp1 … exp141+, prep_*, probe_*)
-data/       # (git-ignored) clinical/social-media datasets — not committed
-features/   # (git-ignored) extracted features / caches
-results/    # (git-ignored) experiment outputs, figures
+code/
+├── bench/                  # unified benchmark harness
+│   ├── README.md           # fixed protocol — do not change mid-study
+│   ├── data.py             # D-Vlog loader + npz cache + registry
+│   ├── data_extra.py       # LMVD / CMDC / E-DAIC loaders (AU and landmark variants)
+│   ├── data_mud3.py        # MUD3 loader (raw / Procrustes-aligned)
+│   ├── models.py           # 4 hosts + Graft wrapper + CoordBranch(full/nospd/notime/nocov)
+│   ├── run.py              # single entry point; early-truncation and segment-control paths
+│   ├── repeat_cv.py        # repeated stratified CV + paired tests + bootstrap CIs
+│   ├── bootci.py           # bootstrap CI on saved predictions
+│   ├── metrics.py          # Acc/P/R/F1/AUC, parameter count
+│   ├── make_table.py       # master comparison table
+│   └── figs*.py            # figures
+└── exp*.py                 # earlier single-question experiments (historical)
+results/bench/              # per-corpus CSVs, master table, figures
 ```
 
-Representative scripts, by phase:
-- `code/exp19_shrinkage_spd.py`, `exp20_confirm.py` — early anchor + Riemannian SPD phase (CMDC/DAIC)
-- `code/exp80_dvlog_official.py`, `exp110_light.py` — coordination model, D-Vlog official benchmark, lightweight design
-- `code/exp104_early.py`, `exp106_attn.py`, `exp109_region.py` — time-axis earliness, attention, discriminative region
-- `code/prep_mud3.py`, `exp121_mud3_coord.py` — MUD3 acquisition, model transplant
-- `code/exp122_leakage.py`, `exp127_confoundfree.py`, `exp124_lrsweep.py` — confound audit + robustness verification
-- `code/exp136_changepoint.py` — within-user change-point detection (negative result)
-- `code/exp138_disfa_au1517.py`, `exp141_affectnet.py` — external AU/region validation (DISFA, AffectNet)
+### Model names
+
+Hosts: `blstm` `tfn` `depdetector` `tamfn`
+Grafted: `<host>+full` `<host>+nospd` `<host>+notime` `<host>+nocov`
+Standalone proposed encoder: `ours`
+
+### Corpora
+
+`dvlog` `lmvd` `lmvd_lmk` `cmdc` `cmdc_lmk` `edaic` `mud3` `mud3_aligned`
+
+E-DAIC is excluded from graft evaluation: **all five models score F1 0.17–0.41**, so the corpus cannot resolve a module effect. The exclusion is decided by baseline performance, independent of our own results.
+
+---
+
+## Running
+
+```bash
+python -m bench.run --corpus dvlog --model 'depdetector+full' --seeds 5
+python -m bench.repeat_cv --corpus mud3 --repeats 3 --models 'depdetector,depdetector+full,depdetector+nospd'
+python -m bench.make_table
+```
+
+Useful flags: `--lr`, `--ep`, `--pca`, `--coord_lr_mult`, `--early 0.2,0.4,...`, `--seg 0:0.4,0.3:0.7,0.6:1.0`
+
+---
 
 ## Data
 
-Publicly available / access-controlled corpora. **Datasets are NOT redistributed here** — obtain them from the original providers under their licenses.
+No datasets are included. D-Vlog, LMVD, CMDC, E-DAIC and MUD3 each require their own access agreement from the original providers. Feature extraction follows each dataset's published specification (OpenFace landmarks/AUs, OpenSMILE or VGGish acoustic features).
 
-| Dataset | Modality | Label | Role |
-|---|---|---|---|
-| **DAIC-WOZ / E-DAIC** | Audio, transcript, OpenFace/CLNF AUs | PHQ-8 | Clinical interview, anchor phase |
-| **CMDC** | Text, audio, OpenFace 2.2 AUs | PHQ-9/HAMD | Clinical, strongest coordination signal |
-| **D-Vlog** | Landmarks + acoustic | Binary | Main coordination benchmark (official split) |
-| **LMVD** | OpenFace AUs + VGGish | Binary | Cross-corpus replication (large-scale vlog) |
-| **MUD3** | Landmarks + acoustic (no raw video) | Binary, self-reported | Longitudinal confound audit (CCAC2026) |
-| **DISFA** | Landmarks + FACS-coded AU intensity | AU intensity 0–5 | External AU-coactivation ground truth (no depression label; validation only) |
-| **AffectNet** | Static face images | 8-way emotion | Static-image region check (no depression label; validation only) |
+---
 
-Facial features are landmark coordinates or OpenFace Action Units. No raw video is used or stored for any dataset.
+## Honest summary
 
-## Method (current pipeline)
+A coordination branch can be attached to four different multimodal depression models at a constant +32,000 parameters. It produces a **significant gain on MUD3 raw** and a **small but uniformly non-negative effect on LMVD**. On other corpora the effect depends on the host and on the metric, and one design component originally assumed essential (the SPD manifold layer) does not appear to contribute.
 
-1. **Representation** — per-window/per-video covariance of AU or landmark coordinates (Ledoit–Wolf shrinkage), i.e. the *coordination* structure, not raw activity.
-2. **Encoder** — SPDNet-style manifold layers (BiMap → ReEig → LogEig) followed by a GRU over the window/video sequence for temporal modeling.
-3. **Fusion** — concatenation with a lightweight 1D-CNN audio branch (concat outperformed attention/gated/bilinear fusion in ablations).
-4. **Evaluation** — AUC/F1 (classification), CCC/MAE (severity regression), multi-seed with permutation/bootstrap CI; confound-controlled variants (position/scale/pose-normalized, recording-environment-standardized) where applicable.
-
-## Requirements
-
-```
-numpy scipy scikit-learn pyriemann torch pandas ruptures openpyxl
-```
-
-## Ethics & privacy
-
-All datasets contain sensitive personal/clinical information and are used under their respective agreements. Only de-identified, pre-extracted facial/acoustic features are processed; no raw video is stored or shared for any dataset in this repository.
-
-## Acknowledgements
-
-Emotion & Memory Interaction Lab, Seokyeong University. Built on prior multimodal depression work (KIICE), the OpenFace / pyRiemann / dlib toolkits, and the D-Vlog, LMVD, MUD3, and DISFA dataset releases.
+The most transferable results here may be the methodological ones in §4: ensembling artifacts, an irreproducible published baseline, and the inadequacy of small official test splits for significance testing.

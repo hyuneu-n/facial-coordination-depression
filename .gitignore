@@ -39,3 +39,12 @@ venv/
 
 # OS
 .DS_Store
+
+# 일회성 패치 스크립트와 백업
+code/patch_*.py
+code/t1_*.py
+code/t2_*.py
+code/coord_lr.py
+code/fig18b.py
+*.pre_*
+*.bak
